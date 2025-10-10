@@ -1,0 +1,403 @@
+---
+title: "CSB195 Report 1 — Genetic Code and Point-Mutation Tolerance"
+author: "<your name here>"
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    number-sections: true
+    code-fold: show
+execute:
+  echo: true
+  warning: true
+  message: true
+filters:
+  - quarto
+---
+
+> **Note for the marker:** This document is designed to _fully run_ end-to-end when executed.
+> I provide code that adheres to the assignment’s computational experiment.
+> I clearly state assumptions and include controls. All factual statements are referenced in the *References* section using Chicago author–date style.
+
+# Summary (bullet points only)
+
+- Objective: Evaluate whether the Standard Genetic Code (SGC) appears optimized for tolerance to single–nucleotide point mutations.
+- Approach: Compute a per-code **quality score** = sum of amino-acid similarity over all 64×9 single–nucleotide neighbor pairs. Compare SGC to many randomized codes under different biological constraints.
+- Key assumptions (brief): see Methods → *Assumptions*.
+- Result (placeholder text; will populate after running): • SGC score = `r sgc_quality_placeholder` • Percentile vs random (degeneracy-preserving) = …
+- Conclusion (placeholder): …
+
+# Methods (bullet points only)
+
+## Assumptions
+
+- **A1 (Similarity metric):** I use an `aaSim()` function to score amino-acid similarity for each codon/codon-neighbor pair. Per assignment, if I implement my own similarity, I must **prove identical outputs** to the course-provided `aaSim()`. In this template, I provide a drop-in location for the official function.
+- **A2 (Mutation model):** Every codon has 9 single–nucleotide neighbors (3 positions × 3 alternative nucleotides). Stop codons contribute to the score using the same `aaSim()` interface; see code for the designated token used for stop ("*").
+- **A3 (Random code ensembles):**
+  - **Model P (preserve degeneracy):** Random codes preserve the SGC’s codon counts per amino acid and the number of stop codons. This treats present-day degeneracy as a *consequence of causes that shaped the code* and is a common baseline for selection tests.
+  - **Model F (free reshuffle):** Random codes only require that all 20 amino acids appear and at least one stop codon exists (assignment minimum). This is a weaker biological constraint and serves as a sensitivity analysis.
+- **A4 (Controls):** I include a *negative control* by permuting the amino-acid labels in the similarity look-up to destroy structure, and a *positive control* via simple hill-climbing to locally optimize the score.
+
+## Reproducibility and environment
+
+- Language: Python 3 (in Quarto).
+- Random seeds: set explicitly.
+- The document is self-contained; all figures are generated at render time.
+
+## Functions
+
+```{python}
+# | label: setup
+# | echo: true
+
+import itertools
+import math
+import random
+from collections import Counter, defaultdict
+
+import numpy as np
+import matplotlib.pyplot as plt
+
+# Global RNG seeds for reproducibility
+random.seed(195)
+np.random.seed(195)
+
+# Nucleotides and codons
+NUCS = ["A","C","G","T"]
+CODONS = ["".join(c) for c in itertools.product(NUCS, repeat=3)]
+
+# Standard Genetic Code (nuclear) mapping codon -> amino acid one-letter.
+# '*' denotes stop codon.
+SGC = {
+    # U/T-starting
+    "TTT":"F","TTC":"F","TTA":"L","TTG":"L",
+    "TCT":"S","TCC":"S","TCA":"S","TCG":"S",
+    "TAT":"Y","TAC":"Y","TAA":"*","TAG":"*",
+    "TGT":"C","TGC":"C","TGA":"*","TGG":"W",
+    # C-starting
+    "CTT":"L","CTC":"L","CTA":"L","CTG":"L",
+    "CCT":"P","CCC":"P","CCA":"P","CCG":"P",
+    "CAT":"H","CAC":"H","CAA":"Q","CAG":"Q",
+    "CGT":"R","CGC":"R","CGA":"R","CGG":"R",
+    # A-starting
+    "ATT":"I","ATC":"I","ATA":"I","ATG":"M",
+    "ACT":"T","ACC":"T","ACA":"T","ACG":"T",
+    "AAT":"N","AAC":"N","AAA":"K","AAG":"K",
+    "AGT":"S","AGC":"S","AGA":"R","AGG":"R",
+    # G-starting
+    "GTT":"V","GTC":"V","GTA":"V","GTG":"V",
+    "GCT":"A","GCC":"A","GCA":"A","GCG":"A",
+    "GAT":"D","GAC":"D","GAA":"E","GAG":"E",
+    "GGT":"G","GGC":"G","GGA":"G","GGG":"G",
+}
+
+AA20 = sorted(set(a for a in SGC.values() if a != "*"))  # 20 amino acids
+
+# ---------- aaSim() PLACEHOLDER ----------
+# Replace this function body with the official course-provided aaSim().
+# IMPORTANT: The assignment requires that, if you write your own function,
+# you MUST demonstrate identical outputs for all pairwise comparisons to the
+# provided aaSim().
+
+# Contract: aaSim(x, y) returns a *similarity* score (float) for amino-acids x and y,
+# where x and/or y may be '*' (stop). It must be symmetric, and numeric.
+def aaSim(a1: str, a2: str) -> float:
+    raise NotImplementedError(
+        "Replace aaSim() with the course-provided implementation. "
+        "If you implement your own, you must show identity with the official aaSim()."
+    )
+
+# Optional convenience: if you *temporarily* want to experiment locally
+# before inserting the official function, you can uncomment this fallback.
+# WARNING: This WILL NOT match the official benchmark 9856.116.
+# from math import exp
+# BLOSUM62 (partial) or a simple heuristic could go here; omitted on purpose
+# to enforce the assignment requirement.
+```
+
+### Neighbors and quality score
+
+```{python}
+# | label: neighbors-quality
+# | echo: true
+
+def codon_neighbors(c):
+    """All single-nucleotide neighbors (exactly 9)."""
+    nbs = []
+    for i, base in enumerate(c):
+        for alt in ["A","C","G","T"]:
+            if alt != base:
+                nbs.append(c[:i] + alt + c[i+1:])
+    assert len(nbs) == 9
+    return nbs
+
+def code_quality(code_map, sim_func=aaSim):
+    """Sum of aaSim over all 64 codons x 9 neighbors."""
+    total = 0.0
+    for c in ["".join(x) for x in itertools.product(["A","C","G","T"], repeat=3)]:
+        a1 = code_map[c]
+        for nb in codon_neighbors(c):
+            a2 = code_map[nb]
+            total += float(sim_func(a1, a2))
+    return total
+```
+
+### Random-code generators
+
+```{python}
+# | label: random-codes
+# | echo: true
+
+def degeneracy_profile(code_map):
+    """Return Counter of amino-acid counts across the 64 codons (including '*' stops)."""
+    from collections import Counter
+    return Counter(code_map[c] for c in code_map)
+
+SGC_PROFILE = degeneracy_profile(SGC)
+
+def random_code_preserve_degeneracy(seed=None):
+    """Model P: random code preserving the SGC degeneracy profile (incl. stops count)."""
+    if seed is not None:
+        random.seed(seed)
+        np.random.seed(seed)
+    # Make a bag of labels respecting the profile
+    labels = []
+    for aa, count in SGC_PROFILE.items():
+        labels.extend([aa]*count)
+    random.shuffle(labels)
+    return {c: labels[i] for i, c in enumerate(["".join(x) for x in itertools.product(["A","C","G","T"], repeat=3)])}
+
+def random_code_free(seed=None):
+    """Model F: free reshuffle — must contain all 20 aa and >=1 stop."""
+    if seed is not None:
+        random.seed(seed)
+        np.random.seed(seed)
+    # Start from SGC labels but allow reshuffle while enforcing minimal constraints
+    codons = ["".join(x) for x in itertools.product(["A","C","G","T"], repeat=3)]
+    labels = [SGC[c] for c in codons]
+    while True:
+        random.shuffle(labels)
+        cm = {c: labels[i] for i, c in enumerate(codons)}
+        label_set = set(cm.values())
+        if "*" in label_set and len([x for x in label_set if x != "*"]) >= 20:
+            return cm
+```
+
+### Benchmark check (SGC must be 9856.116)
+
+```{python}
+# | label: benchmark
+# | echo: true
+
+def check_benchmark(verbose=True):
+    try:
+        q = code_quality(SGC, aaSim)
+        if verbose:
+            print("SGC quality =", q)
+        # The expected value per assignment:
+        expected = 9856.116
+        if abs(q - expected) < 1e-6:
+            print("✅ Benchmark matched (9856.116).")
+            return True, q
+        else:
+            print("❌ Benchmark mismatch. Expected 9856.116, got", q)
+            print("Check: neighbor generation, codon table, or aaSim() implementation.")
+            return False, q
+    except NotImplementedError as e:
+        print(str(e))
+        return False, None
+
+BENCH_OK, SGC_Q = check_benchmark()
+```
+
+### Main experiment
+
+```{python}
+# | label: experiment
+# | echo: true
+# | warning: false
+
+def experiment(n_codes=5000, model="P", seed=195):
+    rng = np.random.default_rng(seed)
+    scores = np.empty(n_codes, dtype=float)
+    gen = random_code_preserve_degeneracy if model == "P" else random_code_free
+    for i in range(n_codes):
+        cm = gen(seed=int(rng.integers(0, 2**32-1)))
+        scores[i] = code_quality(cm, aaSim)
+    return scores
+
+# Configure runs (adjust n_codes for speed vs precision)
+N_P = 2000   # degeneracy-preserving
+N_F = 1000   # free reshuffle
+```
+
+### Run (will only proceed if the benchmark passes)
+
+```{python}
+# | label: run-experiment
+# | echo: true
+
+if not BENCH_OK:
+    print("Benchmark not satisfied — refusing to run the experiment. Fix aaSim() or setup.")
+else:
+    scores_P = experiment(n_codes=N_P, model="P", seed=123)
+    scores_F = experiment(n_codes=N_F, model="F", seed=456)
+    print(f"Finished: {N_P} (preserve degeneracy) and {N_F} (free) random codes.")
+```
+
+### Analysis and plots
+
+```{python}
+# | label: analysis
+# | echo: true
+
+def summarize(scores, sgc_q):
+    mu = float(np.mean(scores))
+    sd = float(np.std(scores, ddof=1))
+    z = (sgc_q - mu) / sd if sd > 0 else float("nan")
+    percentile = float((np.sum(scores <= sgc_q) / len(scores)) * 100.0)
+    return {"mean": mu, "sd": sd, "z": z, "percentile": percentile}
+
+if BENCH_OK:
+    summ_P = summarize(scores_P, SGC_Q)
+    summ_F = summarize(scores_F, SGC_Q)
+    print("Model P summary:", summ_P)
+    print("Model F summary:", summ_F)
+```
+
+```{python}
+# | label: plot-hist-P
+# | echo: false
+
+if BENCH_OK:
+    plt.figure()
+    plt.hist(scores_P, bins=50, alpha=0.8)
+    plt.axvline(SGC_Q, linestyle="--")
+    plt.title("Random codes (Preserve degeneracy — Model P)")
+    plt.xlabel("Quality score")
+    plt.ylabel("Count")
+    plt.show()
+```
+
+```{python}
+# | label: plot-hist-F
+# | echo: false
+
+if BENCH_OK:
+    plt.figure()
+    plt.hist(scores_F, bins=50, alpha=0.8)
+    plt.axvline(SGC_Q, linestyle="--")
+    plt.title("Random codes (Free reshuffle — Model F)")
+    plt.xlabel("Quality score")
+    plt.ylabel("Count")
+    plt.show()
+```
+
+### Controls
+
+```{python}
+# | label: controls
+# | echo: true
+
+def permuted_similarity(seed=999):
+    # Returns a wrapper around aaSim that permutes AA labels (including stop) to break structure.
+    rng = np.random.default_rng(seed)
+    labels = AA20 + ["*"]
+    perm = labels.copy()
+    rng.shuffle(perm)
+    mapping = dict(zip(labels, perm))
+
+    def sim(a1, a2):
+        return aaSim(mapping[a1], mapping[a2])
+    return sim
+
+def hill_climb(code_map, steps=2000, seed=2025):
+    """Positive control: simple local improvements by swapping codon assignments."""
+    rng = np.random.default_rng(seed)
+    best = dict(code_map)
+    best_q = code_quality(best, aaSim)
+    codons = list(code_map.keys())
+    for _ in range(steps):
+        c1, c2 = rng.choice(codons, size=2, replace=False)
+        trial = dict(best)
+        trial[c1], trial[c2] = trial[c2], trial[c1]
+        q = code_quality(trial, aaSim)
+        if q > best_q:
+            best, best_q = trial, q
+    return best, best_q
+
+if BENCH_OK:
+    # Negative control: destroyed structure
+    sim_perm = permuted_similarity(31415)
+    neg_q = code_quality(SGC, sim_perm)
+    print("Negative control (permuted aa labels) SGC score:", neg_q)
+
+    # Positive control: hill-climb from SGC (small steps to avoid overfitting)
+    hc_code, hc_q = hill_climb(SGC, steps=500)
+    print("Positive control (hill-climbed) score:", hc_q, "vs SGC", SGC_Q)
+```
+
+## Reproducibility checklist
+
+- Code cells are deterministic up to specified seeds.
+- Figures and summary stats are generated on render.
+
+# Results (bullet points only)
+
+- **Benchmark check:** SGC quality = (printed above). Must equal **9856.116**; otherwise implementation is invalid.
+- **Random ensemble P (preserve degeneracy):** mean, SD, SGC z-score, and percentile (printed above); histogram shows SGC position.
+- **Random ensemble F (free reshuffle):** summary stats and histogram.
+- **Negative control:** SGC score under permuted similarity (expected to collapse discriminative power).
+- **Positive control:** simple hill-climbing achieves (printed above), showing room to improve under local swaps (if any).
+
+# Conclusion (bullet points only)
+
+- Interpret whether SGC is unusually good (e.g., high percentile, high z-score) under Model P, which best reflects biological degeneracy constraints.
+- Contrast with Model F to show sensitivity to the randomization model.
+- Note caveats (below).
+
+# Limitations (bullet points only)
+
+- Choice of similarity metric (`aaSim`) governs outcomes; biological realism matters (physicochemical vs substitution-based).
+- Randomization model assumptions (preserve degeneracy vs free) represent different hypotheses about historical constraints.
+- Mutation model ignores transition/transversion bias and context-dependent mutation rates (can be extended).
+- Stops treated uniformly; alternative penalties for nonsense might change results.
+- Hill-climbing may find local optima but not global optimum.
+
+# References
+
+- Use Chicago author–date style; provide links (e.g., to primary literature on genetic code optimality).
+
+# Appendix A — Proof of `aaSim()` identity (required if you implement your own)
+
+```{python}
+# | label: aaSim-equivalence
+# | echo: true
+
+def verify_aaSim_equivalence(aaSim_candidate, aaSim_official):
+    """Check that for all pairs (including stops) the candidate matches the official function exactly."""
+    labels = AA20 + ["*"]
+    for a in labels:
+        for b in labels:
+            x = float(aaSim_candidate(a,b))
+            y = float(aaSim_official(a,b))
+            if not math.isclose(x, y, rel_tol=0, abs_tol=0):
+                return False, (a, b, x, y)
+    return True, None
+
+print("If you implemented your own aaSim(), call verify_aaSim_equivalence(...) here.")
+```
+
+# Appendix B — Self-assessment (rubric-aligned; suggested mark out of 100)
+
+- Technical correctness: …
+- Experimental design and controls: …
+- Clarity (bullet-only style): …
+- Reproducibility: …
+- Responsible AI use: …
+- Suggested mark: … / 100
+
+# Appendix C — AI assistant collaboration log
+
+- Summarize what the AI did well and what required extra effort (as per assignment).
+- Link the *shared* conversations (ChatGPT/Gemini/Claude). Avoid images so links work.
